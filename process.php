@@ -79,101 +79,11 @@ function to_array($text){
 }
 
 function compressData($data) {
-    $lines = explode("\n", trim($data));
-    $colorGroups = [];
-
-    foreach ($lines as $line) {
-        list($x, $y, $z, $r, $g, $b) = array_map('intval', explode(',', $line));
-        $colorKey = "$r@$g@$b";
-
-        if (!isset($colorGroups[$colorKey])) {
-            $colorGroups[$colorKey] = [];
-        }
-
-        $colorGroups[$colorKey][] = [$x, $y, $z];
-    }
-
-    $compressedData = [];
-
-    foreach ($colorGroups as $colorKey => $positions) {
-        usort($positions, function($a, $b) {
-            return ($a[0] <=> $b[0]) ?: ($a[1] <=> $b[1]) ?: ($a[2] <=> $b[2]);
-        });
-
-        $segments = [];
-        $segment = [$positions[0]];
-
-        for ($i = 1; $i < count($positions); $i++) {
-            list($x1, $y1, $z1) = $positions[$i - 1];
-            list($x2, $y2, $z2) = $positions[$i];
-
-            $dx = $x2 - $x1;
-            $dy = $y2 - $y1;
-            $dz = $z2 - $z1;
-
-            if (($dx === 1 && $dy === 0 && $dz === 0) ||
-                ($dx === 0 && $dy === 1 && $dz === 0) ||
-                ($dx === 0 && $dy === 0 && $dz === 1)) {
-                $segment[] = [$x2, $y2, $z2];
-            } else {
-                if (count($segment) > 1) {
-                    $segments[] = implode('-', [$segment[0][0] . '@' . $segment[0][1] . '@' . $segment[0][2],
-                                                  $segment[count($segment) - 1][0] . '@' . $segment[count($segment) - 1][1] . '@' . $segment[count($segment) - 1][2]]);
-                } else {
-                    $segments[] = implode('@', $segment[0]);
-                }
-                $segment = [[$x2, $y2, $z2]];
-            }
-        }
-
-        if (count($segment) > 1) {
-            $segments[] = implode('-', [$segment[0][0] . '@' . $segment[0][1] . '@' . $segment[0][2],
-                                          $segment[count($segment) - 1][0] . '@' . $segment[count($segment) - 1][1] . '@' . $segment[count($segment) - 1][2]]);
-        } else {
-            $segments[] = implode('@', $segment[0]);
-        }
-
-        $compressedData[] = "$colorKey|" . implode(':', $segments);
-    }
-
-    return implode('|', $compressedData);
+    //////////////////////////////
 }
 
 function decompressData($compressedData) {
-    $colorBlocks = explode('|', $compressedData);
-    $decompressedData = [];
-
-    for ($i = 0; $i < count($colorBlocks); $i += 2) {
-        $colorKey = $colorBlocks[$i];
-        $positions = explode(':', $colorBlocks[$i + 1]);
-        list($r, $g, $b) = explode('@', $colorKey);
-
-        foreach ($positions as $pos) {
-            if (strpos($pos, '-') !== false) {
-                list($start, $end) = explode('-', $pos);
-                list($x1, $y1, $z1) = explode('@', $start);
-                list($x2, $y2, $z2) = explode('@', $end);
-
-                if ($x1 != $x2) {
-                    for ($x = $x1; $x <= $x2; $x++) {
-                        $decompressedData[] = "$x@$y1@$z1@$r@$g@$b";
-                    }
-                } elseif ($y1 != $y2) {
-                    for ($y = $y1; $y <= $y2; $y++) {
-                        $decompressedData[] = "$x1@$y@$z1@$r@$g@$b";
-                    }
-                } elseif ($z1 != $z2) {
-                    for ($z = $z1; $z <= $z2; $z++) {
-                        $decompressedData[] = "$x1@$y1@$z@$r@$g@$b";
-                    }
-                }
-            } else {
-                $decompressedData[] = "$pos@$r@$g@$b";
-            }
-        }
-    }
-
-    return implode("\n", $decompressedData);
+    /////////////////////////////
 }
 
 $contents = $file_tmp;
