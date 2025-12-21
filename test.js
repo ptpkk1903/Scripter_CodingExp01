@@ -1,4 +1,4 @@
-// voxelizer.js - โค้ดหลักในการแปลง GLB เป็น VOX (ตามต้นฉบับ 100%)
+// voxelizer-optimized.js - Memory-efficient version (1-100MB target)
 const sharp = require('sharp');
 
 class GLBExtractor {
@@ -45,11 +45,10 @@ class GLBExtractor {
     }
     
     getMeshData() {
-        // ใช้ flat arrays แทน array of objects เพื่อประหยัด memory
-        const vertexData = []; // [v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z, ...]
-        const colorData = []; // [r, g, b, r, g, b, ...]
-        const uvData = []; // [u0, v0, u1, v1, u2, v2, ...]
-        const textureIndices = []; // [texIdx, texIdx, ...]
+        const vertexData = [];
+        const colorData = [];
+        const uvData = [];
+        const textureIndices = [];
         
         let triangleCount = 0;
         
@@ -86,17 +85,14 @@ class GLBExtractor {
                     for (let i = 0; i < indices.length; i += 3) {
                         const i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
                         
-                        // เก็บ vertices
                         vertexData.push(
                             positions[i0 * 3], positions[i0 * 3 + 1], positions[i0 * 3 + 2],
                             positions[i1 * 3], positions[i1 * 3 + 1], positions[i1 * 3 + 2],
                             positions[i2 * 3], positions[i2 * 3 + 1], positions[i2 * 3 + 2]
                         );
                         
-                        // เก็บสี
                         colorData.push(color[0], color[1], color[2]);
                         
-                        // เก็บ UV (ถ้ามี)
                         if (texCoords && textureIndex !== -1) {
                             uvData.push(
                                 texCoords[i0 * 2], texCoords[i0 * 2 + 1],
@@ -117,12 +113,6 @@ class GLBExtractor {
         
         console.log(`Loaded ${triangleCount} triangles`);
         
-        // คำนวณ memory usage
-        const oldSize = triangleCount * (9 * 8 + 3 * 8 + 6 * 8 + 8); // object overhead
-        const newSize = vertexData.length * 4 + colorData.length + uvData.length * 4 + textureIndices.length;
-        console.log(`Memory: ${(oldSize / 1024 / 1024).toFixed(2)}MB → ${(newSize / 1024 / 1024).toFixed(2)}MB (saved ${((1 - newSize/oldSize) * 100).toFixed(1)}%)`);
-        
-        // แปลงเป็น TypedArray เพื่อประหยัด memory (ลด ~50%)
         return {
             vertices: new Float32Array(vertexData),
             colors: new Uint8Array(colorData),
@@ -176,53 +166,81 @@ class GLBExtractor {
     }
 }
 
-class BVHNode {
-    constructor(triangles, start, end) {
+// Lightweight BVH - ใช้ indices แทน triangle objects
+class CompactBVHNode {
+    constructor(triIndices, start, end, vertices) {
+        this.triIndices = triIndices;
+        this.start = start;
+        this.end = end;
+        
         if (end - start === 1) {
-            this.triangle = triangles[start];
-            this.bbox = this._triangleBBox(triangles[start]);
+            // Leaf node - เก็บแค่ index
+            this.triIndex = triIndices[start];
+            this.bbox = this._triangleBBox(triIndices[start], vertices);
             this.left = null;
             this.right = null;
         } else {
-            const bbox = this._computeBBox(triangles, start, end);
+            // Internal node
+            const bbox = this._computeBBox(triIndices, start, end, vertices);
             const axis = this._longestAxis(bbox);
             
-            triangles.slice(start, end).sort((a, b) => {
-                const centA = (a.v0[axis] + a.v1[axis] + a.v2[axis]) / 3;
-                const centB = (b.v0[axis] + b.v1[axis] + b.v2[axis]) / 3;
+            // Sort in place
+            const slice = triIndices.slice(start, end);
+            slice.sort((a, b) => {
+                const centA = this._getTriangleCentroid(a, vertices, axis);
+                const centB = this._getTriangleCentroid(b, vertices, axis);
                 return centA - centB;
             });
             
+            for (let i = 0; i < slice.length; i++) {
+                triIndices[start + i] = slice[i];
+            }
+            
             const mid = Math.floor((start + end) / 2);
-            this.left = new BVHNode(triangles, start, mid);
-            this.right = new BVHNode(triangles, mid, end);
+            this.left = new CompactBVHNode(triIndices, start, mid, vertices);
+            this.right = new CompactBVHNode(triIndices, mid, end, vertices);
             this.bbox = this._mergeBBox(this.left.bbox, this.right.bbox);
-            this.triangle = null;
+            this.triIndex = -1;
         }
     }
     
-    _triangleBBox(tri) {
-        const minX = Math.min(tri.v0[0], tri.v1[0], tri.v2[0]);
-        const minY = Math.min(tri.v0[1], tri.v1[1], tri.v2[1]);
-        const minZ = Math.min(tri.v0[2], tri.v1[2], tri.v2[2]);
-        const maxX = Math.max(tri.v0[0], tri.v1[0], tri.v2[0]);
-        const maxY = Math.max(tri.v0[1], tri.v1[1], tri.v2[1]);
-        const maxZ = Math.max(tri.v0[2], tri.v1[2], tri.v2[2]);
-        return { minX, minY, minZ, maxX, maxY, maxZ };
+    _getTriangleCentroid(triIdx, vertices, axis) {
+        const vIdx = triIdx * 9;
+        return (vertices[vIdx + axis] + vertices[vIdx + 3 + axis] + vertices[vIdx + 6 + axis]) / 3;
     }
     
-    _computeBBox(triangles, start, end) {
+    _triangleBBox(triIdx, vertices) {
+        const vIdx = triIdx * 9;
+        const v0x = vertices[vIdx], v0y = vertices[vIdx + 1], v0z = vertices[vIdx + 2];
+        const v1x = vertices[vIdx + 3], v1y = vertices[vIdx + 4], v1z = vertices[vIdx + 5];
+        const v2x = vertices[vIdx + 6], v2y = vertices[vIdx + 7], v2z = vertices[vIdx + 8];
+        
+        return {
+            minX: Math.min(v0x, v1x, v2x),
+            minY: Math.min(v0y, v1y, v2y),
+            minZ: Math.min(v0z, v1z, v2z),
+            maxX: Math.max(v0x, v1x, v2x),
+            maxY: Math.max(v0y, v1y, v2y),
+            maxZ: Math.max(v0z, v1z, v2z)
+        };
+    }
+    
+    _computeBBox(triIndices, start, end, vertices) {
         let minX = Infinity, minY = Infinity, minZ = Infinity;
         let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
         
         for (let i = start; i < end; i++) {
-            const tri = triangles[i];
-            minX = Math.min(minX, tri.v0[0], tri.v1[0], tri.v2[0]);
-            minY = Math.min(minY, tri.v0[1], tri.v1[1], tri.v2[1]);
-            minZ = Math.min(minZ, tri.v0[2], tri.v1[2], tri.v2[2]);
-            maxX = Math.max(maxX, tri.v0[0], tri.v1[0], tri.v2[0]);
-            maxY = Math.max(maxY, tri.v0[1], tri.v1[1], tri.v2[1]);
-            maxZ = Math.max(maxZ, tri.v0[2], tri.v1[2], tri.v2[2]);
+            const vIdx = triIndices[i] * 9;
+            const v0x = vertices[vIdx], v0y = vertices[vIdx + 1], v0z = vertices[vIdx + 2];
+            const v1x = vertices[vIdx + 3], v1y = vertices[vIdx + 4], v1z = vertices[vIdx + 5];
+            const v2x = vertices[vIdx + 6], v2y = vertices[vIdx + 7], v2z = vertices[vIdx + 8];
+            
+            minX = Math.min(minX, v0x, v1x, v2x);
+            minY = Math.min(minY, v0y, v1y, v2y);
+            minZ = Math.min(minZ, v0z, v1z, v2z);
+            maxX = Math.max(maxX, v0x, v1x, v2x);
+            maxY = Math.max(maxY, v0y, v1y, v2y);
+            maxZ = Math.max(maxZ, v0z, v1z, v2z);
         }
         
         return { minX, minY, minZ, maxX, maxY, maxZ };
@@ -246,22 +264,27 @@ class BVHNode {
         };
     }
     
-    intersectAll(ro, rd, results = []) {
+    // Intersection ที่ return แค่ข้อมูลจำเป็น
+    intersectAll(ro, rd, vertices, colors, uvs, texIndices, results = []) {
         if (!this._intersectBBox(ro, rd, this.bbox)) {
             return results;
         }
         
-        if (this.triangle) {
-            const hit = rayTriangleIntersect(ro, rd, this.triangle.v0, this.triangle.v1, this.triangle.v2);
+        if (this.triIndex !== -1) {
+            const hit = this._rayTriangleIntersect(ro, rd, this.triIndex, vertices);
             if (hit) {
-                hit.tri = this.triangle;
-                results.push({ tri: this.triangle, result: hit });
+                results.push({
+                    triIndex: this.triIndex,
+                    t: hit.t,
+                    u: hit.u,
+                    v: hit.v
+                });
             }
             return results;
         }
         
-        if (this.left) this.left.intersectAll(ro, rd, results);
-        if (this.right) this.right.intersectAll(ro, rd, results);
+        if (this.left) this.left.intersectAll(ro, rd, vertices, colors, uvs, texIndices, results);
+        if (this.right) this.right.intersectAll(ro, rd, vertices, colors, uvs, texIndices, results);
         
         return results;
     }
@@ -282,6 +305,46 @@ class BVHNode {
         const tmax = Math.min(Math.max(t1, t2), Math.max(t3, t4), Math.max(t5, t6));
         
         return tmax >= Math.max(0, tmin);
+    }
+    
+    _rayTriangleIntersect(ro, rd, triIdx, vertices) {
+        const EPSILON = 1e-8;
+        const vIdx = triIdx * 9;
+        
+        const v0x = vertices[vIdx], v0y = vertices[vIdx + 1], v0z = vertices[vIdx + 2];
+        const v1x = vertices[vIdx + 3], v1y = vertices[vIdx + 4], v1z = vertices[vIdx + 5];
+        const v2x = vertices[vIdx + 6], v2y = vertices[vIdx + 7], v2z = vertices[vIdx + 8];
+        
+        const e1x = v1x - v0x, e1y = v1y - v0y, e1z = v1z - v0z;
+        const e2x = v2x - v0x, e2y = v2y - v0y, e2z = v2z - v0z;
+        
+        const hx = rd[1] * e2z - rd[2] * e2y;
+        const hy = rd[2] * e2x - rd[0] * e2z;
+        const hz = rd[0] * e2y - rd[1] * e2x;
+        
+        const a = e1x * hx + e1y * hy + e1z * hz;
+        if (Math.abs(a) < EPSILON) return null;
+        
+        const f = 1.0 / a;
+        const sx = ro[0] - v0x, sy = ro[1] - v0y, sz = ro[2] - v0z;
+        const u = f * (sx * hx + sy * hy + sz * hz);
+        
+        if (u < 0.0 || u > 1.0) return null;
+        
+        const qx = sy * e1z - sz * e1y;
+        const qy = sz * e1x - sx * e1z;
+        const qz = sx * e1y - sy * e1x;
+        
+        const v = f * (rd[0] * qx + rd[1] * qy + rd[2] * qz);
+        if (v < 0.0 || u + v > 1.0) return null;
+        
+        const t = f * (e2x * qx + e2y * qy + e2z * qz);
+        
+        if (t > EPSILON) {
+            return { t, u, v };
+        }
+        
+        return null;
     }
 }
 
@@ -327,6 +390,9 @@ class ColorQuantizer {
                 this.colorMap.set(key, i + 1);
             }
         }
+        
+        // ลบ samples ทิ้งเพื่อประหยัด memory
+        this.colorSamples = null;
     }
     
     medianCut(colors, maxColors) {
@@ -427,17 +493,13 @@ class ColorQuantizer {
 class VOXWriter {
     constructor(quantizer) {
         this.voxels = new Map();
-        this.voxelNormals = new Map();
         this.quantizer = quantizer;
     }
     
-    addVoxel(x, y, z, r, g, b, normal = null) {
+    addVoxel(x, y, z, r, g, b) {
         const key = `${x},${y},${z}`;
         const colorIdx = this.quantizer.addColor(r, g, b);
         this.voxels.set(key, colorIdx);
-        if (normal) {
-            this.voxelNormals.set(key, normal);
-        }
     }
     
     smoothColors(radius = 1) {
@@ -583,142 +645,77 @@ function calculateTriangleNormal(v0, v1, v2) {
     return [nx / len, ny / len, nz / len];
 }
 
-function rayTriangleIntersect(ro, rd, v0, v1, v2) {
-    const EPSILON = 1e-8;
-    
-    const e1x = v1[0] - v0[0], e1y = v1[1] - v0[1], e1z = v1[2] - v0[2];
-    const e2x = v2[0] - v0[0], e2y = v2[1] - v0[1], e2z = v2[2] - v0[2];
-    
-    const hx = rd[1] * e2z - rd[2] * e2y;
-    const hy = rd[2] * e2x - rd[0] * e2z;
-    const hz = rd[0] * e2y - rd[1] * e2x;
-    
-    const a = e1x * hx + e1y * hy + e1z * hz;
-    if (Math.abs(a) < EPSILON) return null;
-    
-    const f = 1.0 / a;
-    const sx = ro[0] - v0[0], sy = ro[1] - v0[1], sz = ro[2] - v0[2];
-    const u = f * (sx * hx + sy * hy + sz * hz);
-    
-    if (u < 0.0 || u > 1.0) return null;
-    
-    const qx = sy * e1z - sz * e1y;
-    const qy = sz * e1x - sx * e1z;
-    const qz = sx * e1y - sy * e1x;
-    
-    const v = f * (rd[0] * qx + rd[1] * qy + rd[2] * qz);
-    if (v < 0.0 || u + v > 1.0) return null;
-    
-    const t = f * (e2x * qx + e2y * qy + e2z * qz);
-    
-    if (t > EPSILON) {
-        return { t, u, v };
-    }
-    
-    return null;
-}
-
 function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCallback) {
     const { vertices, colors, uvs, textureIndices, triangleCount } = meshData;
     
-    // แปลง flat arrays กลับเป็น triangle objects สำหรับ BVH
-    const triangles = [];
-    for (let i = 0; i < triangleCount; i++) {
-        const vIdx = i * 9;
-        const cIdx = i * 3;
-        const uvIdx = i * 6;
-        
-        const tri = {
-            v0: [vertices[vIdx], vertices[vIdx + 1], vertices[vIdx + 2]],
-            v1: [vertices[vIdx + 3], vertices[vIdx + 4], vertices[vIdx + 5]],
-            v2: [vertices[vIdx + 6], vertices[vIdx + 7], vertices[vIdx + 8]],
-            color: [colors[cIdx], colors[cIdx + 1], colors[cIdx + 2]]
-        };
-        
-        if (textureIndices[i] !== -1) {
-            tri.uv0 = [uvs[uvIdx], uvs[uvIdx + 1]];
-            tri.uv1 = [uvs[uvIdx + 2], uvs[uvIdx + 3]];
-            tri.uv2 = [uvs[uvIdx + 4], uvs[uvIdx + 5]];
-            tri.textureIndex = textureIndices[i];
-        }
-        
-        triangles.push(tri);
-    }
+    console.log(`Starting voxelization: ${triangleCount} triangles, resolution ${resolution}`);
     
+    // คำนวณ bounding box
     let minX = Infinity, minY = Infinity, minZ = Infinity;
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
     
-    for (const tri of triangles) {
-        for (const v of [tri.v0, tri.v1, tri.v2]) {
-            minX = Math.min(minX, v[0]);
-            minY = Math.min(minY, v[1]);
-            minZ = Math.min(minZ, v[2]);
-            maxX = Math.max(maxX, v[0]);
-            maxY = Math.max(maxY, v[1]);
-            maxZ = Math.max(maxZ, v[2]);
+    for (let i = 0; i < triangleCount; i++) {
+        const vIdx = i * 9;
+        for (let j = 0; j < 3; j++) {
+            const x = vertices[vIdx + j * 3];
+            const y = vertices[vIdx + j * 3 + 1];
+            const z = vertices[vIdx + j * 3 + 2];
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            minZ = Math.min(minZ, z);
+            maxX = Math.max(maxX, x);
+            maxY = Math.max(maxY, y);
+            maxZ = Math.max(maxZ, z);
         }
     }
     
     const sizeX = maxX - minX, sizeY = maxY - minY, sizeZ = maxZ - minZ;
     const scale = (resolution - 1) / Math.max(sizeX, sizeY, sizeZ);
     
-    const scaledTris = triangles.map(tri => {
-        const scaled = {
-            v0: [
-                (tri.v0[0] - minX) * scale,
-                (tri.v0[1] - minY) * scale,
-                (tri.v0[2] - minZ) * scale
-            ],
-            v1: [
-                (tri.v1[0] - minX) * scale,
-                (tri.v1[1] - minY) * scale,
-                (tri.v1[2] - minZ) * scale
-            ],
-            v2: [
-                (tri.v2[0] - minX) * scale,
-                (tri.v2[1] - minY) * scale,
-                (tri.v2[2] - minZ) * scale
-            ],
-            color: tri.color
-        };
-        
-        if (tri.uv0) {
-            scaled.uv0 = tri.uv0;
-            scaled.uv1 = tri.uv1;
-            scaled.uv2 = tri.uv2;
-            scaled.textureIndex = tri.textureIndex;
-        }
-        
-        return scaled;
-    });
-    
-    for (const tri of scaledTris) {
-        tri.normal = calculateTriangleNormal(tri.v0, tri.v1, tri.v2);
+    // Scale vertices in place
+    const scaledVertices = new Float32Array(vertices.length);
+    for (let i = 0; i < vertices.length; i += 3) {
+        scaledVertices[i] = (vertices[i] - minX) * scale;
+        scaledVertices[i + 1] = (vertices[i + 1] - minY) * scale;
+        scaledVertices[i + 2] = (vertices[i + 2] - minZ) * scale;
     }
     
+    // สร้าง BVH ด้วย indices
+    const triIndices = new Uint32Array(triangleCount);
+    for (let i = 0; i < triangleCount; i++) {
+        triIndices[i] = i;
+    }
+    
+    console.log('Building BVH...');
+    const bvh = new CompactBVHNode(triIndices, 0, triangleCount, scaledVertices);
+    
     const quantizer = new ColorQuantizer(255);
-    const voxWriter = new VOXWriter(quantizer);
     const gridSize = Math.min(Math.ceil(resolution) + 1, 256);
     
-    const bvh = new BVHNode(scaledTris, 0, scaledTris.length);
-    
+    // Ray directions: 6 ทิศทางหลัก + 4 ทิศทางแนวทแยงที่สำคัญ (10 ทิศทาง)
     const rayDirs = [
-        [1, 0, 0], [-1, 0, 0],
-        [0, 1, 0], [0, -1, 0],
-        [0, 0, 1], [0, 0, -1],
-        [0.707, 0.707, 0], [-0.707, -0.707, 0],
-        [0.707, 0, 0.707], [-0.707, 0, -0.707],
-        [0, 0.707, 0.707], [0, -0.707, -0.707],
-        [0.577, 0.577, 0.577], [-0.577, -0.577, -0.577],
-        [0.577, -0.577, 0.577], [-0.577, 0.577, -0.577]
+        [1, 0, 0], [-1, 0, 0],      // ±X
+        [0, 1, 0], [0, -1, 0],      // ±Y
+        [0, 0, 1], [0, 0, -1],      // ±Z
+        [0.707, 0.707, 0],          // XY diagonal
+        [0.707, 0, 0.707],          // XZ diagonal
+        [0, 0.707, 0.707],          // YZ diagonal
+        [0.577, 0.577, 0.577]       // XYZ diagonal (corner)
     ];
     
-    const surfaceVoxels = new Map();
+    console.log('Pass 1: Collecting color samples...');
     
-    // Pass 1: Collecting colors
+    // Pass 1: Color sampling (แบบ memory-efficient)
+    let sampledColors = 0;
+    const maxSamples = 30000; // ลดลงจาก 50000
+    const sampleStep = Math.max(1, Math.floor(gridSize / Math.sqrt(maxSamples / rayDirs.length)));
+    
+    // ใช้ Set แทน array เพื่อ deduplicate สีอัตโนมัติ
+    const colorSet = new Set();
+    
     for (const dir of rayDirs) {
-        for (let i = 0; i < gridSize; i++) {
-            for (let j = 0; j < gridSize; j++) {
+        for (let i = 0; i < gridSize; i += sampleStep) {
+            for (let j = 0; j < gridSize; j += sampleStep) {
                 const absMax = Math.max(Math.abs(dir[0]), Math.abs(dir[1]), Math.abs(dir[2]));
                 let ro;
                 
@@ -730,42 +727,71 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
                     ro = [i, j, dir[2] > 0 ? -1 : gridSize];
                 }
                 
-                const hits = bvh.intersectAll(ro, dir);
-                hits.sort((a, b) => a.result.t - b.result.t);
+                const hits = bvh.intersectAll(ro, dir, scaledVertices, colors, uvs, textureIndices);
                 
-                for (let h = 0; h < Math.min(3, hits.length); h++) {
+                for (let h = 0; h < Math.min(2, hits.length); h++) {
                     const hit = hits[h];
-                    const { tri, result } = hit;
-                    let color = tri.color;
+                    const triIdx = hit.triIndex;
+                    const cIdx = triIdx * 3;
                     
-                    if (tri.uv0 && tri.textureIndex !== null && extractor.textures[tri.textureIndex]) {
-                        const w = 1.0 - result.u - result.v;
-                        const interpU = Math.max(0, Math.min(1, w * tri.uv0[0] + result.u * tri.uv1[0] + result.v * tri.uv2[0]));
-                        const interpV = Math.max(0, Math.min(1, w * tri.uv0[1] + result.u * tri.uv1[1] + result.v * tri.uv2[1]));
+                    let color = [colors[cIdx], colors[cIdx + 1], colors[cIdx + 2]];
+                    
+                    if (textureIndices[triIdx] !== -1 && extractor.textures[textureIndices[triIdx]]) {
+                        const uvIdx = triIdx * 6;
+                        const w = 1.0 - hit.u - hit.v;
+                        const interpU = Math.max(0, Math.min(1, w * uvs[uvIdx] + hit.u * uvs[uvIdx + 2] + hit.v * uvs[uvIdx + 4]));
+                        const interpV = Math.max(0, Math.min(1, w * uvs[uvIdx + 1] + hit.u * uvs[uvIdx + 3] + hit.v * uvs[uvIdx + 5]));
                         
-                        const sampledColor = extractor.sampleTexture(tri.textureIndex, interpU, interpV);
+                        const sampledColor = extractor.sampleTexture(textureIndices[triIdx], interpU, interpV);
                         if (sampledColor) {
                             color = sampledColor;
                         }
                     }
                     
-                    quantizer.addColorSample(color[0], color[1], color[2]);
+                    // Pack RGB เป็น integer เดียวเพื่อประหยัด memory
+                    const packed = (color[0] << 16) | (color[1] << 8) | color[2];
+                    colorSet.add(packed);
+                    sampledColors++;
+                    
+                    if (sampledColors >= maxSamples) break;
                 }
+                
+                if (sampledColors >= maxSamples) break;
             }
+            if (sampledColors >= maxSamples) break;
         }
+        if (sampledColors >= maxSamples) break;
     }
     
+    // แปลง Set กลับเป็น array และส่งให้ quantizer
+    for (const packed of colorSet) {
+        const r = (packed >> 16) & 0xFF;
+        const g = (packed >> 8) & 0xFF;
+        const b = packed & 0xFF;
+        quantizer.addColorSample(r, g, b);
+    }
+    
+    console.log(`Sampled ${colorSet.size} unique colors from ${sampledColors} samples`);
+    colorSet.clear(); // ล้าง Set ทิ้ง
+    
     quantizer.buildPalette();
+    console.log(`Built palette: ${quantizer.palette.length} colors`);
     progressCallback(30);
     
-    // Pass 2: Voxelizing with palette
+    // Pass 2: Voxelization (streaming แบบ per-direction)
+    const voxWriter = new VOXWriter(quantizer);
+    
     let rayCount = 0;
     const totalRays = rayDirs.length;
     
     for (const dir of rayDirs) {
         rayCount++;
         
+        // Process แบบ streaming per direction เพื่อลด peak memory
         for (let i = 0; i < gridSize; i++) {
+            // ใช้ local Map สำหรับแต่ละ slice แล้วค่อย merge
+            const sliceVoxels = new Map();
+            
             for (let j = 0; j < gridSize; j++) {
                 const absMax = Math.max(Math.abs(dir[0]), Math.abs(dir[1]), Math.abs(dir[2]));
                 let ro;
@@ -778,12 +804,12 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
                     ro = [i, j, dir[2] > 0 ? -1 : gridSize];
                 }
                 
-                const hits = bvh.intersectAll(ro, dir);
-                hits.sort((a, b) => a.result.t - b.result.t);
+                const hits = bvh.intersectAll(ro, dir, scaledVertices, colors, uvs, textureIndices);
+                hits.sort((a, b) => a.t - b.t);
                 
                 for (let h = 0; h < Math.min(3, hits.length); h++) {
                     const hit = hits[h];
-                    const t = hit.result.t;
+                    const t = hit.t;
                     
                     const hitPos = [
                         ro[0] + t * dir[0],
@@ -801,25 +827,43 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
                         voxelPos[1] >= 0 && voxelPos[1] < gridSize &&
                         voxelPos[2] >= 0 && voxelPos[2] < gridSize) {
                         
-                        const { tri, result } = hit;
-                        let color = tri.color;
+                        const triIdx = hit.triIndex;
+                        const cIdx = triIdx * 3;
+                        let color = [colors[cIdx], colors[cIdx + 1], colors[cIdx + 2]];
                         
-                        if (tri.uv0 && tri.textureIndex !== null && extractor.textures[tri.textureIndex]) {
-                            const w = 1.0 - result.u - result.v;
-                            const interpU = Math.max(0, Math.min(1, w * tri.uv0[0] + result.u * tri.uv1[0] + result.v * tri.uv2[0]));
-                            const interpV = Math.max(0, Math.min(1, w * tri.uv0[1] + result.u * tri.uv1[1] + result.v * tri.uv2[1]));
+                        if (textureIndices[triIdx] !== -1 && extractor.textures[textureIndices[triIdx]]) {
+                            const uvIdx = triIdx * 6;
+                            const w = 1.0 - hit.u - hit.v;
+                            const interpU = Math.max(0, Math.min(1, w * uvs[uvIdx] + hit.u * uvs[uvIdx + 2] + hit.v * uvs[uvIdx + 4]));
+                            const interpV = Math.max(0, Math.min(1, w * uvs[uvIdx + 1] + hit.u * uvs[uvIdx + 3] + hit.v * uvs[uvIdx + 5]));
                             
-                            const sampledColor = extractor.sampleTexture(tri.textureIndex, interpU, interpV);
+                            const sampledColor = extractor.sampleTexture(textureIndices[triIdx], interpU, interpV);
                             if (sampledColor) {
                                 color = sampledColor;
                             }
                         }
                         
-                        const key = `${voxelPos[0]},${voxelPos[1]},${voxelPos[2]}`;
-                        if (!surfaceVoxels.has(key)) {
-                            surfaceVoxels.set(key, { color, normal: tri.normal });
+                        // Pack position เป็น key เดียว (32-bit integer)
+                        const key = (voxelPos[0] << 16) | (voxelPos[1] << 8) | voxelPos[2];
+                        if (!sliceVoxels.has(key)) {
+                            sliceVoxels.set(key, (color[0] << 16) | (color[1] << 8) | color[2]);
                         }
                     }
+                }
+            }
+            
+            // Merge slice voxels เข้า voxWriter
+            for (const [key, packedColor] of sliceVoxels) {
+                const x = (key >> 16) & 0xFF;
+                const y = (key >> 8) & 0xFF;
+                const z = key & 0xFF;
+                const r = (packedColor >> 16) & 0xFF;
+                const g = (packedColor >> 8) & 0xFF;
+                const b = packedColor & 0xFF;
+                
+                const posKey = `${x},${y},${z}`;
+                if (!voxWriter.voxels.has(posKey)) {
+                    voxWriter.addVoxel(x, y, z, r, g, b);
                 }
             }
         }
@@ -828,11 +872,13 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
         progressCallback(progress);
     }
     
-    // Writing voxels
+    console.log(`Found ${voxWriter.voxels.size} surface voxels`);
+    
+    // Center voxels
     let minVoxX = Infinity, minVoxY = Infinity, minVoxZ = Infinity;
     let maxVoxX = -Infinity, maxVoxY = -Infinity, maxVoxZ = -Infinity;
     
-    for (const key of surfaceVoxels.keys()) {
+    for (const key of voxWriter.voxels.keys()) {
         const [x, y, z] = key.split(',').map(Number);
         minVoxX = Math.min(minVoxX, x);
         minVoxY = Math.min(minVoxY, y);
@@ -846,24 +892,31 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
     const centerOffsetY = Math.floor((gridSize - (maxVoxY - minVoxY + 1)) / 2) - minVoxY;
     const centerOffsetZ = Math.floor((gridSize - (maxVoxZ - minVoxZ + 1)) / 2) - minVoxZ;
     
-    for (const [key, data] of surfaceVoxels) {
-        const [x, y, z] = key.split(',').map(Number);
-        voxWriter.addVoxel(
-            x + centerOffsetX, 
-            y + centerOffsetY, 
-            z + centerOffsetZ, 
-            data.color[0], 
-            data.color[1], 
-            data.color[2], 
-            data.normal
-        );
+    // Re-center voxels
+    if (centerOffsetX !== 0 || centerOffsetY !== 0 || centerOffsetZ !== 0) {
+        const centeredVoxels = new Map();
+        for (const [key, colorIdx] of voxWriter.voxels) {
+            const [x, y, z] = key.split(',').map(Number);
+            const newKey = `${x + centerOffsetX},${y + centerOffsetY},${z + centerOffsetZ}`;
+            centeredVoxels.set(newKey, colorIdx);
+        }
+        voxWriter.voxels = centeredVoxels;
     }
     
     progressCallback(85);
     
-    voxWriter.smoothColors(smoothRadius);
+    if (smoothRadius > 0) {
+        console.log('Smoothing colors...');
+        voxWriter.smoothColors(smoothRadius);
+    }
     
     progressCallback(95);
+    
+    // Log memory usage estimate
+    const bvhSize = triangleCount * 4; // indices only
+    const voxelSize = voxWriter.voxels.size * 32; // approximate
+    const totalMemory = (bvhSize + voxelSize) / 1024 / 1024;
+    console.log(`Estimated memory usage: ${totalMemory.toFixed(2)}MB`);
     
     return { voxWriter, size: [gridSize, gridSize, gridSize] };
 }
