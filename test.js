@@ -1,4 +1,4 @@
-// voxelizer-optimized.js - Memory-efficient version (1-100MB target)
+// voxelizer-fixed.js - แก้ไขปัญหา transform, union, color
 const sharp = require('sharp');
 
 class GLBExtractor {
@@ -12,6 +12,8 @@ class GLBExtractor {
         
         this.binData = buffer.slice(20 + jsonLength + 8);
         this.textures = [];
+        
+        console.log(`GLB loaded: ${this.gltf.meshes?.length || 0} meshes, ${this.gltf.nodes?.length || 0} nodes`);
     }
     
     async extractTextures() {
@@ -30,6 +32,7 @@ class GLBExtractor {
                 this.textures.push(decoded);
             }
         }
+        console.log(`Extracted ${this.textures.length} textures`);
     }
     
     async decodePNG(buffer) {
@@ -40,85 +43,211 @@ class GLBExtractor {
             
             return { width: info.width, height: info.height, data: data };
         } catch (e) {
+            console.warn('Texture decode failed:', e.message);
             return null;
         }
     }
     
-    getMeshData() {
-        const vertexData = [];
-        const colorData = [];
-        const uvData = [];
-        const textureIndices = [];
+    // ⭐ สร้าง transformation matrix จาก node
+    _createTransformMatrix(node) {
+        const m = new Float32Array(16);
         
-        let triangleCount = 0;
+        if (node.matrix) {
+            // มี matrix โดยตรง
+            for (let i = 0; i < 16; i++) m[i] = node.matrix[i];
+        } else {
+            // สร้างจาก TRS (Translation, Rotation, Scale)
+            const t = node.translation || [0, 0, 0];
+            const r = node.rotation || [0, 0, 0, 1]; // quaternion
+            const s = node.scale || [1, 1, 1];
+            
+            // สร้าง rotation matrix จาก quaternion
+            const x = r[0], y = r[1], z = r[2], w = r[3];
+            const x2 = x * 2, y2 = y * 2, z2 = z * 2;
+            const xx = x * x2, xy = x * y2, xz = x * z2;
+            const yy = y * y2, yz = y * z2, zz = z * z2;
+            const wx = w * x2, wy = w * y2, wz = w * z2;
+            
+            m[0] = (1 - (yy + zz)) * s[0];
+            m[1] = (xy + wz) * s[0];
+            m[2] = (xz - wy) * s[0];
+            m[3] = 0;
+            
+            m[4] = (xy - wz) * s[1];
+            m[5] = (1 - (xx + zz)) * s[1];
+            m[6] = (yz + wx) * s[1];
+            m[7] = 0;
+            
+            m[8] = (xz + wy) * s[2];
+            m[9] = (yz - wx) * s[2];
+            m[10] = (1 - (xx + yy)) * s[2];
+            m[11] = 0;
+            
+            m[12] = t[0];
+            m[13] = t[1];
+            m[14] = t[2];
+            m[15] = 1;
+        }
         
-        for (let meshIdx = 0; meshIdx < this.gltf.meshes.length; meshIdx++) {
-            const mesh = this.gltf.meshes[meshIdx];
+        return m;
+    }
+    
+    // ⭐ คูณ matrix
+    _multiplyMatrices(a, b) {
+        const result = new Float32Array(16);
+        for (let i = 0; i < 4; i++) {
+            for (let j = 0; j < 4; j++) {
+                result[i * 4 + j] = 
+                    a[i * 4 + 0] * b[0 * 4 + j] +
+                    a[i * 4 + 1] * b[1 * 4 + j] +
+                    a[i * 4 + 2] * b[2 * 4 + j] +
+                    a[i * 4 + 3] * b[3 * 4 + j];
+            }
+        }
+        return result;
+    }
+    
+    // ⭐ Transform vertex ด้วย matrix
+    _transformVertex(v, matrix) {
+        const x = v[0], y = v[1], z = v[2];
+        return [
+            matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12],
+            matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13],
+            matrix[2] * x + matrix[6] * y + matrix[10] * z + matrix[14]
+        ];
+    }
+    
+    // ⭐ Traverse scene graph แบบ recursive
+    _traverseNode(nodeIdx, parentTransform, meshDataCollector) {
+        const node = this.gltf.nodes[nodeIdx];
+        
+        // คำนวณ local transform
+        const localTransform = this._createTransformMatrix(node);
+        
+        // รวมกับ parent transform
+        const worldTransform = parentTransform ? 
+            this._multiplyMatrices(parentTransform, localTransform) : 
+            localTransform;
+        
+        // ถ้า node มี mesh
+        if (node.mesh !== undefined) {
+            const mesh = this.gltf.meshes[node.mesh];
+            console.log(`Processing mesh ${node.mesh} with transform`);
             
             for (const primitive of mesh.primitives) {
-                const positions = this._readAccessor(this.gltf.accessors[primitive.attributes.POSITION]);
-                const texCoords = primitive.attributes.TEXCOORD_0 ? 
-                    this._readAccessor(this.gltf.accessors[primitive.attributes.TEXCOORD_0]) : null;
-                const indices = primitive.indices !== undefined ? 
-                    this._readAccessor(this.gltf.accessors[primitive.indices]) : null;
-                
-                let material = null;
-                let textureIndex = -1;
-                
-                if (primitive.material !== undefined) {
-                    material = this.gltf.materials[primitive.material];
-                    
-                    if (material.pbrMetallicRoughness?.baseColorTexture) {
-                        const texIdx = material.pbrMetallicRoughness.baseColorTexture.index;
-                        textureIndex = this.gltf.textures[texIdx].source;
-                    }
-                }
-                
-                const defaultColor = material?.pbrMetallicRoughness?.baseColorFactor || [0.8, 0.8, 0.8, 1.0];
-                const color = [
-                    Math.floor(defaultColor[0] * 255),
-                    Math.floor(defaultColor[1] * 255),
-                    Math.floor(defaultColor[2] * 255)
-                ];
-                
-                if (indices) {
-                    for (let i = 0; i < indices.length; i += 3) {
-                        const i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
-                        
-                        vertexData.push(
-                            positions[i0 * 3], positions[i0 * 3 + 1], positions[i0 * 3 + 2],
-                            positions[i1 * 3], positions[i1 * 3 + 1], positions[i1 * 3 + 2],
-                            positions[i2 * 3], positions[i2 * 3 + 1], positions[i2 * 3 + 2]
-                        );
-                        
-                        colorData.push(color[0], color[1], color[2]);
-                        
-                        if (texCoords && textureIndex !== -1) {
-                            uvData.push(
-                                texCoords[i0 * 2], texCoords[i0 * 2 + 1],
-                                texCoords[i1 * 2], texCoords[i1 * 2 + 1],
-                                texCoords[i2 * 2], texCoords[i2 * 2 + 1]
-                            );
-                            textureIndices.push(textureIndex);
-                        } else {
-                            uvData.push(0, 0, 0, 0, 0, 0);
-                            textureIndices.push(-1);
-                        }
-                        
-                        triangleCount++;
-                    }
-                }
+                this._processPrimitive(primitive, worldTransform, meshDataCollector);
             }
         }
         
-        console.log(`Loaded ${triangleCount} triangles`);
+        // Traverse children
+        if (node.children) {
+            for (const childIdx of node.children) {
+                this._traverseNode(childIdx, worldTransform, meshDataCollector);
+            }
+        }
+    }
+    
+    // ⭐ Process primitive พร้อม transform
+    _processPrimitive(primitive, transform, collector) {
+        const positions = this._readAccessor(this.gltf.accessors[primitive.attributes.POSITION]);
+        const texCoords = primitive.attributes.TEXCOORD_0 ? 
+            this._readAccessor(this.gltf.accessors[primitive.attributes.TEXCOORD_0]) : null;
+        const indices = primitive.indices !== undefined ? 
+            this._readAccessor(this.gltf.accessors[primitive.indices]) : null;
+        
+        let material = null;
+        let textureIndex = -1;
+        
+        if (primitive.material !== undefined) {
+            material = this.gltf.materials[primitive.material];
+            
+            if (material.pbrMetallicRoughness?.baseColorTexture) {
+                const texIdx = material.pbrMetallicRoughness.baseColorTexture.index;
+                textureIndex = this.gltf.textures[texIdx].source;
+            }
+        }
+        
+        // ⭐ Default color - ถ้าไม่มีให้เป็นสีเทาแทน [0,0,0]
+        const defaultColor = material?.pbrMetallicRoughness?.baseColorFactor || [0.7, 0.7, 0.7, 1.0];
+        const color = [
+            Math.max(10, Math.floor(defaultColor[0] * 255)), // ป้องกันสีดำ (0)
+            Math.max(10, Math.floor(defaultColor[1] * 255)),
+            Math.max(10, Math.floor(defaultColor[2] * 255))
+        ];
+        
+        if (indices) {
+            for (let i = 0; i < indices.length; i += 3) {
+                const i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
+                
+                // ⭐ Transform vertices
+                const v0 = this._transformVertex([positions[i0 * 3], positions[i0 * 3 + 1], positions[i0 * 3 + 2]], transform);
+                const v1 = this._transformVertex([positions[i1 * 3], positions[i1 * 3 + 1], positions[i1 * 3 + 2]], transform);
+                const v2 = this._transformVertex([positions[i2 * 3], positions[i2 * 3 + 1], positions[i2 * 3 + 2]], transform);
+                
+                collector.vertices.push(...v0, ...v1, ...v2);
+                collector.colors.push(color[0], color[1], color[2]);
+                
+                if (texCoords && textureIndex !== -1) {
+                    collector.uvs.push(
+                        texCoords[i0 * 2], texCoords[i0 * 2 + 1],
+                        texCoords[i1 * 2], texCoords[i1 * 2 + 1],
+                        texCoords[i2 * 2], texCoords[i2 * 2 + 1]
+                    );
+                    collector.textureIndices.push(textureIndex);
+                } else {
+                    collector.uvs.push(0, 0, 0, 0, 0, 0);
+                    collector.textureIndices.push(-1);
+                }
+                
+                collector.triangleCount++;
+            }
+        }
+    }
+    
+    // ⭐ Main function - รวม mesh ทั้งหมดเข้าด้วยกัน
+    getMeshData() {
+        const collector = {
+            vertices: [],
+            colors: [],
+            uvs: [],
+            textureIndices: [],
+            triangleCount: 0
+        };
+        
+        // หา scene หลัก
+        const sceneIdx = this.gltf.scene !== undefined ? this.gltf.scene : 0;
+        const scene = this.gltf.scenes[sceneIdx];
+        
+        console.log(`Processing scene ${sceneIdx} with ${scene.nodes.length} root nodes`);
+        
+        // Traverse ทุก node ใน scene
+        for (const nodeIdx of scene.nodes) {
+            this._traverseNode(nodeIdx, null, collector);
+        }
+        
+        console.log(`✓ Loaded ${collector.triangleCount} triangles from all meshes`);
+        
+        // ⭐ ตรวจสอบสีที่เป็น 0 และแจ้งเตือน
+        let zeroColorCount = 0;
+        for (let i = 0; i < collector.colors.length; i += 3) {
+            if (collector.colors[i] === 0 && collector.colors[i+1] === 0 && collector.colors[i+2] === 0) {
+                zeroColorCount++;
+                // แก้ไขเป็นสีเทา
+                collector.colors[i] = 128;
+                collector.colors[i+1] = 128;
+                collector.colors[i+2] = 128;
+            }
+        }
+        if (zeroColorCount > 0) {
+            console.warn(`⚠ Fixed ${zeroColorCount} triangles with zero color (changed to gray)`);
+        }
         
         return {
-            vertices: new Float32Array(vertexData),
-            colors: new Uint8Array(colorData),
-            uvs: new Float32Array(uvData),
-            textureIndices: new Int8Array(textureIndices),
-            triangleCount: triangleCount
+            vertices: new Float32Array(collector.vertices),
+            colors: new Uint8Array(collector.colors),
+            uvs: new Float32Array(collector.uvs),
+            textureIndices: new Int8Array(collector.textureIndices),
+            triangleCount: collector.triangleCount
         };
     }
     
@@ -166,7 +295,7 @@ class GLBExtractor {
     }
 }
 
-// Lightweight BVH - ใช้ indices แทน triangle objects
+// Lightweight BVH - เหมือนเดิม
 class CompactBVHNode {
     constructor(triIndices, start, end, vertices) {
         this.triIndices = triIndices;
@@ -174,17 +303,14 @@ class CompactBVHNode {
         this.end = end;
         
         if (end - start === 1) {
-            // Leaf node - เก็บแค่ index
             this.triIndex = triIndices[start];
             this.bbox = this._triangleBBox(triIndices[start], vertices);
             this.left = null;
             this.right = null;
         } else {
-            // Internal node
             const bbox = this._computeBBox(triIndices, start, end, vertices);
             const axis = this._longestAxis(bbox);
             
-            // Sort in place
             const slice = triIndices.slice(start, end);
             slice.sort((a, b) => {
                 const centA = this._getTriangleCentroid(a, vertices, axis);
@@ -264,7 +390,6 @@ class CompactBVHNode {
         };
     }
     
-    // Intersection ที่ return แค่ข้อมูลจำเป็น
     intersectAll(ro, rd, vertices, colors, uvs, texIndices, results = []) {
         if (!this._intersectBBox(ro, rd, this.bbox)) {
             return results;
@@ -391,7 +516,6 @@ class ColorQuantizer {
             }
         }
         
-        // ลบ samples ทิ้งเพื่อประหยัด memory
         this.colorSamples = null;
     }
     
@@ -630,25 +754,71 @@ class VOXWriter {
     }
 }
 
-function calculateTriangleNormal(v0, v1, v2) {
-    const e1x = v1[0] - v0[0], e1y = v1[1] - v0[1], e1z = v1[2] - v0[2];
-    const e2x = v2[0] - v0[0], e2y = v2[1] - v0[1], e2z = v2[2] - v0[2];
+// ⭐ ฟังก์ชันตรวจสอบความสมบูรณ์ของ voxel
+function validateVoxelCoverage(meshData, voxWriter, scale, offset) {
+    console.log('\n=== Validating Voxel Coverage ===');
     
-    const nx = e1y * e2z - e1z * e2y;
-    const ny = e1z * e2x - e1x * e2z;
-    const nz = e1x * e2y - e1y * e2x;
+    const { vertices, triangleCount } = meshData;
+    let missingTriangles = 0;
+    const samplePointsPerTriangle = 5;
     
-    const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    for (let i = 0; i < triangleCount; i++) {
+        const vIdx = i * 9;
+        
+        // Sample points ภายใน triangle
+        let hasVoxel = false;
+        
+        for (let s = 0; s < samplePointsPerTriangle; s++) {
+            let u = Math.random();
+            let v = Math.random();
+            
+            if (u + v > 1.0) {
+                u = 1.0 - u;
+                v = 1.0 - v;
+            }
+            const w = 1.0 - u - v;
+            
+            const px = w * vertices[vIdx] + u * vertices[vIdx + 3] + v * vertices[vIdx + 6];
+            const py = w * vertices[vIdx + 1] + u * vertices[vIdx + 4] + v * vertices[vIdx + 7];
+            const pz = w * vertices[vIdx + 2] + u * vertices[vIdx + 5] + v * vertices[vIdx + 8];
+            
+            const vx = Math.floor(px * scale + offset[0]);
+            const vy = Math.floor(py * scale + offset[1]);
+            const vz = Math.floor(pz * scale + offset[2]);
+            
+            const key = `${vx},${vy},${vz}`;
+            
+            if (voxWriter.voxels.has(key)) {
+                hasVoxel = true;
+                break;
+            }
+        }
+        
+        if (!hasVoxel) {
+            missingTriangles++;
+        }
+    }
     
-    if (len < 1e-8) return [0, 0, 1];
+    const coverage = ((triangleCount - missingTriangles) / triangleCount * 100).toFixed(2);
+    console.log(`Triangle Coverage: ${coverage}% (${triangleCount - missingTriangles}/${triangleCount})`);
+    console.log(`Missing triangles: ${missingTriangles}`);
     
-    return [nx / len, ny / len, nz / len];
+    if (missingTriangles > triangleCount * 0.1) {
+        console.warn('⚠ WARNING: More than 10% of triangles are not covered by voxels!');
+    }
+    
+    return {
+        coverage: parseFloat(coverage),
+        missingTriangles,
+        totalTriangles: triangleCount
+    };
 }
 
 function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCallback) {
     const { vertices, colors, uvs, textureIndices, triangleCount } = meshData;
     
-    console.log(`Starting voxelization: ${triangleCount} triangles, resolution ${resolution}`);
+    console.log(`\n=== Starting voxelization ===`);
+    console.log(`Triangles: ${triangleCount}, Resolution: ${resolution}`);
     
     // คำนวณ bounding box
     let minX = Infinity, minY = Infinity, minZ = Infinity;
@@ -669,10 +839,12 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
         }
     }
     
+    console.log(`Bounding box: [${minX.toFixed(2)}, ${minY.toFixed(2)}, ${minZ.toFixed(2)}] to [${maxX.toFixed(2)}, ${maxY.toFixed(2)}, ${maxZ.toFixed(2)}]`);
+    
     const sizeX = maxX - minX, sizeY = maxY - minY, sizeZ = maxZ - minZ;
     const scale = (resolution - 1) / Math.max(sizeX, sizeY, sizeZ);
     
-    // Scale vertices in place
+    // Scale vertices
     const scaledVertices = new Float32Array(vertices.length);
     for (let i = 0; i < vertices.length; i += 3) {
         scaledVertices[i] = (vertices[i] - minX) * scale;
@@ -680,7 +852,7 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
         scaledVertices[i + 2] = (vertices[i + 2] - minZ) * scale;
     }
     
-    // สร้าง BVH ด้วย indices
+    // สร้าง BVH
     const triIndices = new Uint32Array(triangleCount);
     for (let i = 0; i < triangleCount; i++) {
         triIndices[i] = i;
@@ -692,25 +864,34 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
     const quantizer = new ColorQuantizer(255);
     const gridSize = Math.min(Math.ceil(resolution) + 1, 256);
     
-    // Ray directions: 6 ทิศทางหลัก + 4 ทิศทางแนวทแยงที่สำคัญ (10 ทิศทาง)
+    // ⭐ เพิ่มทิศทาง ray ให้ครอบคลุมมากขึ้น (26 ทิศทาง = 6 หลัก + 12 edge + 8 corner)
     const rayDirs = [
-        [1, 0, 0], [-1, 0, 0],      // ±X
-        [0, 1, 0], [0, -1, 0],      // ±Y
-        [0, 0, 1], [0, 0, -1],      // ±Z
-        [0.707, 0.707, 0],          // XY diagonal
-        [0.707, 0, 0.707],          // XZ diagonal
-        [0, 0.707, 0.707],          // YZ diagonal
-        [0.577, 0.577, 0.577]       // XYZ diagonal (corner)
+        // 6 main axes
+        [1, 0, 0], [-1, 0, 0],
+        [0, 1, 0], [0, -1, 0],
+        [0, 0, 1], [0, 0, -1],
+        // 12 edge diagonals
+        [0.707, 0.707, 0], [0.707, -0.707, 0],
+        [-0.707, 0.707, 0], [-0.707, -0.707, 0],
+        [0.707, 0, 0.707], [0.707, 0, -0.707],
+        [-0.707, 0, 0.707], [-0.707, 0, -0.707],
+        [0, 0.707, 0.707], [0, 0.707, -0.707],
+        [0, -0.707, 0.707], [0, -0.707, -0.707],
+        // 8 corner diagonals
+        [0.577, 0.577, 0.577], [0.577, 0.577, -0.577],
+        [0.577, -0.577, 0.577], [0.577, -0.577, -0.577],
+        [-0.577, 0.577, 0.577], [-0.577, 0.577, -0.577],
+        [-0.577, -0.577, 0.577], [-0.577, -0.577, -0.577]
     ];
     
+    console.log(`Using ${rayDirs.length} ray directions for better coverage`);
     console.log('Pass 1: Collecting color samples...');
     
-    // Pass 1: Color sampling (แบบ memory-efficient)
+    // Pass 1: Color sampling
     let sampledColors = 0;
-    const maxSamples = 30000; // ลดลงจาก 50000
+    const maxSamples = 30000;
     const sampleStep = Math.max(1, Math.floor(gridSize / Math.sqrt(maxSamples / rayDirs.length)));
     
-    // ใช้ Set แทน array เพื่อ deduplicate สีอัตโนมัติ
     const colorSet = new Set();
     
     for (const dir of rayDirs) {
@@ -748,7 +929,6 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
                         }
                     }
                     
-                    // Pack RGB เป็น integer เดียวเพื่อประหยัด memory
                     const packed = (color[0] << 16) | (color[1] << 8) | color[2];
                     colorSet.add(packed);
                     sampledColors++;
@@ -763,7 +943,6 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
         if (sampledColors >= maxSamples) break;
     }
     
-    // แปลง Set กลับเป็น array และส่งให้ quantizer
     for (const packed of colorSet) {
         const r = (packed >> 16) & 0xFF;
         const g = (packed >> 8) & 0xFF;
@@ -771,25 +950,25 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
         quantizer.addColorSample(r, g, b);
     }
     
-    console.log(`Sampled ${colorSet.size} unique colors from ${sampledColors} samples`);
-    colorSet.clear(); // ล้าง Set ทิ้ง
+    console.log(`✓ Sampled ${colorSet.size} unique colors from ${sampledColors} samples`);
+    colorSet.clear();
     
     quantizer.buildPalette();
-    console.log(`Built palette: ${quantizer.palette.length} colors`);
+    console.log(`✓ Built palette: ${quantizer.palette.length} colors`);
     progressCallback(30);
     
-    // Pass 2: Voxelization (streaming แบบ per-direction)
+    // Pass 2: Voxelization
     const voxWriter = new VOXWriter(quantizer);
     
     let rayCount = 0;
     const totalRays = rayDirs.length;
     
+    console.log('Pass 2: Voxelizing geometry...');
+    
     for (const dir of rayDirs) {
         rayCount++;
         
-        // Process แบบ streaming per direction เพื่อลด peak memory
         for (let i = 0; i < gridSize; i++) {
-            // ใช้ local Map สำหรับแต่ละ slice แล้วค่อย merge
             const sliceVoxels = new Map();
             
             for (let j = 0; j < gridSize; j++) {
@@ -807,7 +986,8 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
                 const hits = bvh.intersectAll(ro, dir, scaledVertices, colors, uvs, textureIndices);
                 hits.sort((a, b) => a.t - b.t);
                 
-                for (let h = 0; h < Math.min(3, hits.length); h++) {
+                // ⭐ เพิ่มจำนวน hits ที่ process จาก 3 เป็น 5 เพื่อ coverage ดีขึ้น
+                for (let h = 0; h < Math.min(5, hits.length); h++) {
                     const hit = hits[h];
                     const t = hit.t;
                     
@@ -843,7 +1023,6 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
                             }
                         }
                         
-                        // Pack position เป็น key เดียว (32-bit integer)
                         const key = (voxelPos[0] << 16) | (voxelPos[1] << 8) | voxelPos[2];
                         if (!sliceVoxels.has(key)) {
                             sliceVoxels.set(key, (color[0] << 16) | (color[1] << 8) | color[2]);
@@ -852,7 +1031,6 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
                 }
             }
             
-            // Merge slice voxels เข้า voxWriter
             for (const [key, packedColor] of sliceVoxels) {
                 const x = (key >> 16) & 0xFF;
                 const y = (key >> 8) & 0xFF;
@@ -872,7 +1050,7 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
         progressCallback(progress);
     }
     
-    console.log(`Found ${voxWriter.voxels.size} surface voxels`);
+    console.log(`✓ Found ${voxWriter.voxels.size} surface voxels`);
     
     // Center voxels
     let minVoxX = Infinity, minVoxY = Infinity, minVoxZ = Infinity;
@@ -888,11 +1066,12 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
         maxVoxZ = Math.max(maxVoxZ, z);
     }
     
+    console.log(`Voxel bounds: [${minVoxX}, ${minVoxY}, ${minVoxZ}] to [${maxVoxX}, ${maxVoxY}, ${maxVoxZ}]`);
+    
     const centerOffsetX = Math.floor((gridSize - (maxVoxX - minVoxX + 1)) / 2) - minVoxX;
     const centerOffsetY = Math.floor((gridSize - (maxVoxY - minVoxY + 1)) / 2) - minVoxY;
     const centerOffsetZ = Math.floor((gridSize - (maxVoxZ - minVoxZ + 1)) / 2) - minVoxZ;
     
-    // Re-center voxels
     if (centerOffsetX !== 0 || centerOffsetY !== 0 || centerOffsetZ !== 0) {
         const centeredVoxels = new Map();
         for (const [key, colorIdx] of voxWriter.voxels) {
@@ -901,27 +1080,41 @@ function voxelizeMesh(meshData, resolution, extractor, smoothRadius, progressCal
             centeredVoxels.set(newKey, colorIdx);
         }
         voxWriter.voxels = centeredVoxels;
+        console.log(`✓ Centered voxels with offset [${centerOffsetX}, ${centerOffsetY}, ${centerOffsetZ}]`);
     }
     
     progressCallback(85);
     
+    // ⭐ Validate coverage
+    const validation = validateVoxelCoverage(
+        { vertices: scaledVertices, triangleCount },
+        voxWriter,
+        1.0,
+        [centerOffsetX, centerOffsetY, centerOffsetZ]
+    );
+    
     if (smoothRadius > 0) {
-        console.log('Smoothing colors...');
+        console.log(`Smoothing colors (radius=${smoothRadius})...`);
         voxWriter.smoothColors(smoothRadius);
     }
     
     progressCallback(95);
     
-    // Log memory usage estimate
-    const bvhSize = triangleCount * 4; // indices only
-    const voxelSize = voxWriter.voxels.size * 32; // approximate
+    const bvhSize = triangleCount * 4;
+    const voxelSize = voxWriter.voxels.size * 32;
     const totalMemory = (bvhSize + voxelSize) / 1024 / 1024;
-    console.log(`Estimated memory usage: ${totalMemory.toFixed(2)}MB`);
+    console.log(`Memory usage: ${totalMemory.toFixed(2)}MB`);
+    console.log('=== Voxelization complete ===\n');
     
-    return { voxWriter, size: [gridSize, gridSize, gridSize] };
+    return { 
+        voxWriter, 
+        size: [gridSize, gridSize, gridSize],
+        validation
+    };
 }
 
 module.exports = {
     GLBExtractor,
     voxelizeMesh
 };
+
